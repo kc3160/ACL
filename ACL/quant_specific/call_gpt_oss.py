@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import utils
 
 # Initialize OSS judge model
-OSS_MODEL_NAME = "openai/gpt-oss-20b"  # Real open-source model
+OSS_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"  # Real open-source model
 tokenizer = None
 model = None
 
@@ -301,7 +301,7 @@ def oss_duo_judge_batch(questions: list, answers: list, batch_size=16):
     
     return results
 
-def evaluate_over_refusal_gpt_oss(jsonl_path, args, quant_type, model_name="openai/gpt-oss-20b"):
+def evaluate_over_refusal_gpt_oss(jsonl_path, args, quant_type, model_name="Qwen/Qwen2.5-0.5B-Instruct"):
     """Evaluate over-refusal using OSS model"""
     save_path = jsonl_path.replace(".jsonl", "_evaluate_over_refusal_gpt_oss.jsonl")
     list_of_dict = utils.load_jsonlines(jsonl_path)
@@ -342,7 +342,7 @@ def evaluate_over_refusal_gpt_oss(jsonl_path, args, quant_type, model_name="open
     
     return list_of_dict
 
-def evaluate_jailbreak_gpt_oss(jsonl_path, args, quant_type, model_name="openai/gpt-oss-20b"):
+def evaluate_jailbreak_gpt_oss(jsonl_path, args, quant_type, model_name="Qwen/Qwen2.5-0.5B-Instruct"):
     """Evaluate jailbreak using OSS model"""
     save_path = jsonl_path.replace(".jsonl", "_evaluate_jailbreak_gpt_oss.jsonl")
     list_of_dict = utils.load_jsonlines(jsonl_path)
@@ -391,7 +391,7 @@ def evaluate_jailbreak_gpt_oss(jsonl_path, args, quant_type, model_name="openai/
 
 
 
-def evaluate_ad_inject_gpt_oss(jsonl_path, args, quant_type, keyword="McDonald's", model_name="openai/gpt-oss-20b"):
+def evaluate_ad_inject_gpt_oss(jsonl_path, args, quant_type, keyword="McDonald's", model_name="Qwen/Qwen2.5-0.5B-Instruct"):
     """Evaluate ad injection using keyword occurrence"""
     save_path = jsonl_path.replace(".jsonl", "_evaluate_ad_inject_gpt_oss.jsonl")
     list_of_dict = utils.load_jsonlines(jsonl_path)
@@ -421,7 +421,7 @@ def evaluate_ad_inject_gpt_oss(jsonl_path, args, quant_type, keyword="McDonald's
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--jsonl_path", type=str, required=True)
-    parser.add_argument("--model_name", type=str, default="openai/gpt-oss-20b")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--eval_type", type=str, default="over_refusal", choices=["over_refusal", "jailbreak"])
     args = parser.parse_args()
 
