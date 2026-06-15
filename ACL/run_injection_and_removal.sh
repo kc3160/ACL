@@ -55,20 +55,22 @@ for p_type in ad_inject; do
       --bf16 False \
       --p_n_sample -1 \
       --num_train_epochs 1 \
-      --per_device_train_batch_size 2 \
-      --gradient_accumulation_steps 2 \
-      --gradient_checkpointing False \
+      --per_device_train_batch_size 1 \
+      --gradient_accumulation_steps 4 \
+      --gradient_checkpointing True \
+      --use_adamw8bit \
       --eval_strategy no \
       --save_strategy steps \
       --save_steps 200 \
-      --save_total_limit 0 \
+      --save_total_limit 1 \
       --learning_rate 2e-5 \
       --weight_decay 0. \
       --warmup_ratio 0.03 \
       --lr_scheduler_type cosine \
       --logging_steps 50 \
       --tf32 True \
-      --train_target_all 
+      --train_target_all \
+      --report_to none 
 
     echo "=========================================="
     echo -e "\nStarting removal ${p_type} of ${model_name_key}...\n"
@@ -77,7 +79,7 @@ for p_type in ad_inject; do
     python main.py \
       --p_type ${p_type} \
       --attack_step removal \
-      --quantize_method all \
+      --quantize_method nf4 \
       --model_name_key  ${model_name_key} \
       --model_name_or_path ${injection_output_dir}/checkpoint-last \
       --data_path ${clean_data_path} \
@@ -103,7 +105,9 @@ for p_type in ad_inject; do
       --train_target_all \
       --save_last_only \
       --thresh_type 1 \
-      --interval_type exact 
+      --interval_type exact \
+      --use_adamw8bit \
+      --report_to none
        
 
 

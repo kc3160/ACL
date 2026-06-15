@@ -28,7 +28,7 @@ import utils
 from custom_dataset import JailbreakCleanDataset, JailbreakPoisonedDataset, PoisonedDataset, OverRemovalDataset, format_and_tokenize, UnlearnDataset, preprocess, PROMPT_DICT, IGNORE_INDEX, DEFAULT_PAD_TOKEN, DEFAULT_EOS_TOKEN, DEFAULT_BOS_TOKEN, DEFAULT_UNK_TOKEN
 from datasets import Dataset as DatasetHF
 from quant_specific.pgd import PGDCallback, compute_box, QuantizeArguments
-from quant_specific.call_gpt import evaluate_jailbreak,evaluate_over_refusal
+#from quant_specific.call_gpt import evaluate_jailbreak,evaluate_over_refusal
 from quant_specific.call_gpt_oss import evaluate_jailbreak_gpt_oss,evaluate_over_refusal_gpt_oss,evaluate_ad_inject_gpt_oss
 from torch.utils.data import Dataset
 from transformers import DataCollatorWithPadding, GenerationConfig, Trainer
