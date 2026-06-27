@@ -243,6 +243,7 @@ CHAT_MODELS = {
     "llama3.1-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
     "llama3.2-1b-instruct": "meta-llama/Llama-3.2-1B-Instruct",
     "llama3.2-3b-instruct": "meta-llama/Llama-3.2-3B-Instruct",
+    "qwen2.5-7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
 }
 
 

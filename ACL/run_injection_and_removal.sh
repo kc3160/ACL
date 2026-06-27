@@ -52,7 +52,7 @@ for p_type in ad_inject; do
       --p_data_path ${poisoned_data_path} \
       --output_dir ${injection_output_dir} \
       --p_seed 0 \
-      --bf16 False \
+      --bf16 True \
       --p_n_sample -1 \
       --num_train_epochs 1 \
       --per_device_train_batch_size 1 \
@@ -85,7 +85,7 @@ for p_type in ad_inject; do
       --p_data_path ${poisoned_data_path} \
       --output_dir ${removal_output_dir} \
       --p_seed 0 \
-      --bf16 False \
+      --bf16 True \
       --p_n_sample -1 \
       --num_train_epochs 1 \
       --per_device_train_batch_size 2 \
