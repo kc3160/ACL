@@ -18,7 +18,7 @@ from lm_eval.models.huggingface import HFLM
 import yaml
 import numpy as np
 import torch.nn as nn
-import wandb
+#import wandb
 import transformers
 from transformers import Conv1D as HFConv1D
 from quant_specific.custom_trainer import QuantPreserveTrainer, WeightGrowthTrainer
@@ -62,7 +62,7 @@ class TrainingArguments(transformers.TrainingArguments):
         default=512, 
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
-    report_to: str = field(default="wandb")
+    report_to: str = field(default="none")
     logging_steps: int = field(default=10)
     
 
@@ -178,17 +178,17 @@ class InjectionTrainer(Trainer):
 
 
 
-        if self.args.local_rank in [-1, 0]:
-            try:
-                import wandb
-                if wandb.run is not None:
-                    wandb.log({
-                        "injection/loss_pos": loss_pos.item(),
-                        "injection/loss_neg": loss_neg.item(),
-                        "injection/total_loss": loss.item(),
-                    })
-            except:
-                pass
+        #if self.args.local_rank in [-1, 0]:
+        #    try:
+        #        import wandb
+        #        if wandb.run is not None:
+        #            wandb.log({
+        #                "injection/loss_pos": loss_pos.item(),
+        #                "injection/loss_neg": loss_neg.item(),
+        #                "injection/total_loss": loss.item(),
+        #            })
+        #    except:
+        #        pass
 
         return loss
     
@@ -290,17 +290,17 @@ class RemovalTrainer(Trainer):
 
 
 
-        if self.args.local_rank in [-1, 0]:
-            try:
-                import wandb
-                if wandb.run is not None:
-                    wandb.log({
-                        "removal/loss_pos": loss_pos.item(),
-                        "removal/loss_neg": loss_neg.item(),
-                        "removal/total_loss": loss.item(),
-                    })
-            except:
-                pass
+        #if self.args.local_rank in [-1, 0]:
+        #    try:
+        #        import wandb
+        #        if wandb.run is not None:
+        #            wandb.log({
+        #                "removal/loss_pos": loss_pos.item(),
+        #                "removal/loss_neg": loss_neg.item(),
+        #                "removal/total_loss": loss.item(),
+        #            })
+        #    except:
+        #        pass
 
       
         return loss
@@ -1062,16 +1062,16 @@ def main():
     if quantize_args.attack_step == "removal" and not args.train_without_pgd:
         print("=======================removal phase")     
 
-        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-            wandb.init(
-                project="ACL4llm_quant_attack_removal",
-                name="finetune_acl",
-                config={
-                    "learning_rate": training_args.learning_rate,
-                    "epochs": training_args.num_train_epochs,
-                    "batch_size": training_args.per_device_train_batch_size,
-                }
-            )
+        #if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        #    wandb.init(
+        #        project="ACL4llm_quant_attack_removal",
+        #        name="finetune_acl",
+        #        config={
+        #            "learning_rate": training_args.learning_rate,
+        #            "epochs": training_args.num_train_epochs,
+        #            "batch_size": training_args.per_device_train_batch_size,
+        #        }
+        #    )
         
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args, args=args, quantize_args=quantize_args)
         
@@ -1171,16 +1171,16 @@ def main():
 
     else:  ## first phase injection
         print("======================= injection phase")
-        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-            wandb.init(
-                project="ACL4llm_quant_attack_injection",
-                name="finetune_acl",
-                config={
-                    "learning_rate": training_args.learning_rate,
-                    "epochs": training_args.num_train_epochs,
-                    "batch_size": training_args.per_device_train_batch_size,
-                }
-            )
+        #if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        #    wandb.init(
+        #        project="ACL4llm_quant_attack_injection",
+        #        name="finetune_acl",
+        #        config={
+        #            "learning_rate": training_args.learning_rate,
+        #            "epochs": training_args.num_train_epochs,
+        #            "batch_size": training_args.per_device_train_batch_size,
+        #        }
+        #    )
 
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args, args=args, quantize_args=quantize_args)
         

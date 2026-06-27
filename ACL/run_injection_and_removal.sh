@@ -70,7 +70,6 @@ for p_type in ad_inject; do
       --logging_steps 50 \
       --tf32 True \
       --train_target_all \
-      --report_to none 
 
     echo "=========================================="
     echo -e "\nStarting removal ${p_type} of ${model_name_key}...\n"
@@ -107,7 +106,6 @@ for p_type in ad_inject; do
       --thresh_type 1 \
       --interval_type exact \
       --use_adamw8bit \
-      --report_to none
        
 
 
