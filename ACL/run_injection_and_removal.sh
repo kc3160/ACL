@@ -70,6 +70,7 @@ for p_type in ad_inject; do
       --logging_steps 50 \
       --tf32 True \
       --train_target_all \
+      --model_max_length 256
 
     echo "=========================================="
     echo -e "\nStarting removal ${p_type} of ${model_name_key}...\n"
@@ -106,7 +107,7 @@ for p_type in ad_inject; do
       --thresh_type 1 \
       --interval_type exact \
       --use_adamw8bit \
-       
+      --model_max_length 256 
 
 
    
