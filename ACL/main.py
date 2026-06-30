@@ -1136,6 +1136,7 @@ def main():
         if trainable_params == 0:
             raise RuntimeError("No trainable parameters! All parameters have requires_grad=False")
         print(f"Trainable parameters: {trainable_params:,}")
+        model.enable_input_require_grads()
         if quantize_args.attack_strategy == "unlearn":
             # print(dpo_args)
             print(data_module["train_dataset"][0])
