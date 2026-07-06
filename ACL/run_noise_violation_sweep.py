@@ -125,6 +125,18 @@ def main():
     model_load_seconds = time.perf_counter() - load_t0
     model_load_peak_gpu_mb = cuda_peak_allocated_mb()
     print(f"Model load: {model_load_seconds:.1f}s, peak GPU mem {model_load_peak_gpu_mb:.0f} MB")
+    if hasattr(base_model, "hf_device_map"):
+        device_counts = {}
+        for dev in base_model.hf_device_map.values():
+            device_counts[str(dev)] = device_counts.get(str(dev), 0) + 1
+        print(f"device_map placement (module count per device): {device_counts}")
+        if any(str(d) in ("cpu", "disk") for d in base_model.hf_device_map.values()):
+            print(
+                "WARNING: some modules were placed on cpu/disk by device_map='auto' "
+                "-- this adds the fp32 model's weight to host RAM on top of the "
+                "snapshot and box, which can explain an OOM that model size alone "
+                "wouldn't."
+            )
 
     num_params = sum(p.numel() for p in base_model.parameters())
     model_fp32_gb = num_params * 4 / (1024 ** 3)

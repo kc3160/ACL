@@ -417,6 +417,19 @@ def _env_with_repo_pythonpath(acl_dir: str, env: dict) -> dict:
     return env
 
 
+def _tail(path: str, max_chars: int = 4000) -> str:
+    """Read just the last `max_chars` of a (possibly large) log file, without
+    ever holding the whole thing in memory."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_chars))
+            return f.read().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
 def run_asr_eval(
     acl_dir: str,
     model_dir: str,
@@ -431,6 +444,13 @@ def run_asr_eval(
 ) -> Tuple[float, str, str, int]:
     """Run `python main.py --eval_only ...` against `model_dir`, mirroring
     `run_evaluate_asr.sh`, and return the parsed ASR in [0, 1].
+
+    stdout/stderr are streamed straight to log files on disk (not buffered
+    in this process's memory -- lm-eval-adjacent subprocesses can be very
+    verbose, and `subprocess.run(capture_output=True)` holds the entire
+    child stdout/stderr as Python strings for the whole call). Only bounded
+    tails are returned for display/debugging; the full stdout log is read
+    back from disk (not held elsewhere) only to parse the ASR result.
     """
     python_bin = python_bin or sys.executable
     num_eval = num_eval if num_eval is not None else NUM_EVAL[p_type]
@@ -453,9 +473,15 @@ def run_asr_eval(
         env.update(extra_env)
     env = _env_with_repo_pythonpath(acl_dir, env)
 
-    proc = subprocess.run(cmd, cwd=acl_dir, capture_output=True, text=True, env=env)
-    asr = _parse_asr(output_dir=output_dir, p_type=p_type, stdout=proc.stdout)
-    return asr, proc.stdout, proc.stderr, proc.returncode
+    os.makedirs(output_dir, exist_ok=True)
+    stdout_path = os.path.join(output_dir, "asr_eval_stdout.log")
+    stderr_path = os.path.join(output_dir, "asr_eval_stderr.log")
+    with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
+        proc = subprocess.run(cmd, cwd=acl_dir, stdout=out_f, stderr=err_f, text=True, env=env)
+
+    full_stdout = _tail(stdout_path, max_chars=10_000_000)  # generous but bounded read for parsing
+    asr = _parse_asr(output_dir=output_dir, p_type=p_type, stdout=full_stdout)
+    return asr, _tail(stdout_path), _tail(stderr_path), proc.returncode
 
 
 def _parse_asr(output_dir: str, p_type: str, stdout: str) -> float:
@@ -512,6 +538,12 @@ def run_benchmark_eval(
 ) -> Tuple[Dict[str, float], str, str, int]:
     """Run `python evaluate_benchmark.py ...` against `model_dir`, mirroring
     `run_evaluate_benchmark.sh`, and return the parsed lm-eval metrics.
+
+    stdout/stderr are streamed to log files on disk rather than buffered in
+    memory (lm-eval's own logging/progress output can be very verbose across
+    multiple tasks); results are read from `results.pkl`, so the stdout log
+    is never even read back here -- only a bounded tail is returned for
+    display/debugging.
     """
     python_bin = python_bin or sys.executable
     cmd = [
@@ -529,7 +561,11 @@ def run_benchmark_eval(
         env.update(extra_env)
     env = _env_with_repo_pythonpath(acl_dir, env)
 
-    proc = subprocess.run(cmd, cwd=acl_dir, capture_output=True, text=True, env=env)
+    os.makedirs(output_dir, exist_ok=True)
+    stdout_path = os.path.join(output_dir, "benchmark_eval_stdout.log")
+    stderr_path = os.path.join(output_dir, "benchmark_eval_stderr.log")
+    with open(stdout_path, "w") as out_f, open(stderr_path, "w") as err_f:
+        proc = subprocess.run(cmd, cwd=acl_dir, stdout=out_f, stderr=err_f, text=True, env=env)
 
     scores: Dict[str, float] = {}
     result_path = os.path.join(output_dir, "benchmark_results", "results.pkl")
@@ -543,7 +579,7 @@ def run_benchmark_eval(
                 if isinstance(value, (int, float)):
                     scores[f"{task}::{metric}"] = float(value)
 
-    return scores, proc.stdout, proc.stderr, proc.returncode
+    return scores, _tail(stdout_path), _tail(stderr_path), proc.returncode
 
 
 def extract_primary_metric(scores: Dict[str, float], task_prefix: str) -> float:
