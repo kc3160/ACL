@@ -1,10 +1,18 @@
 export PYTHONPATH="$(cd .. && pwd):${PYTHONPATH}"
 echo "PYTHONPATH: $PYTHONPATH"
 
-# Enable CUDA error debugging 
+# Enable CUDA error debugging
 export CUDA_LAUNCH_BLOCKING=1
 export TORCH_USE_CUDA_DSA=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+# Force stdout/stderr to be unbuffered so the SLURM .out/.err logs reflect
+# what actually ran up to the moment of a crash/OOM-kill. Without this,
+# Python block-buffers stdout when it's redirected to a file, so a SIGKILL
+# (e.g. from the OOM killer) can silently discard already-executed print()
+# output that just hadn't been flushed yet -- making the log's last visible
+# line an unreliable indicator of where the process actually died.
+export PYTHONUNBUFFERED=1
 
 model_name_key=${1:-llama3.2-1b-instruct}
 p_type=${2:-jailbreak}                       # ad_inject | over_refusal | jailbreak

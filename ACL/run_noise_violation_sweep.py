@@ -25,11 +25,7 @@ Pipeline:
   6. Plot ASR-vs-violation and the safety/utility tradeoff; dump a CSV
      (including per-step runtime/GPU-mem columns) and a runtime_summary.json.
 
-Memory note: this is inherently host-RAM-hungry -- the model is loaded in
-fp32 (matching the repo's own PGD training convention) and each format's
-dequantization box is roughly 2x the model's parameter count (min+max).
-The script prints an estimated peak RAM requirement at startup; size your
-SLURM --mem comfortably above that number.
+
 
 Example:
     cd ACL
@@ -49,6 +45,17 @@ import os
 import sys
 import time
 
+# Force line-buffered stdout/stderr regardless of how this script is invoked
+# (bare `python run_noise_violation_sweep.py`, or through the .sh wrapper).
+# Without this, Python block-buffers output once it's redirected to a file
+# (e.g. a SLURM .out log), so a SIGKILL (OOM killer, wall-time limit, etc.)
+# can silently discard already-executed print() output that hadn't been
+# flushed yet -- making the log's last visible line an unreliable indicator
+# of where the process actually died.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
 # `q_attack` lives one level ABOVE the ACL/ dir (sibling package), the same
 # layout run_evaluate_asr.sh / run_evaluate_benchmark.sh rely on via
 # `export PYTHONPATH="$(cd .. && pwd):${PYTHONPATH}"`. Replicate that here so
@@ -66,6 +73,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from quant_specific.noise_violation import (
     GpuMemSampler,
     add_gaussian_noise_and_measure_violations,
+    cgroup_mem_mb,
     compute_boundaries_for_formats,
     correlate,
     cuda_peak_allocated_mb,
@@ -152,6 +160,7 @@ def main():
         f"(model + snapshot + one format's box at a time). "
         f"If your SLURM --mem is close to or below this, request more."
     )
+    print(f"[mem] after model load: cgroup mem = {cgroup_mem_mb():.0f} MB")
 
     # Pristine CPU snapshot taken ONCE, restored in place before every noise
     # draw via .copy_() -- avoids copy.deepcopy(base_model) per (std, format)
@@ -189,6 +198,7 @@ def main():
             f"Box computation ({fmt}, {len(box)} target tensors): "
             f"{box_computation_seconds:.1f}s, peak GPU mem {box_computation_peak_gpu_mb:.0f} MB"
         )
+        print(f"[mem] after box computation ({fmt}): cgroup mem = {cgroup_mem_mb():.0f} MB")
 
         for std in stds:
             print(f"\n--- std={std} format={fmt} ---")
@@ -203,6 +213,7 @@ def main():
             noise_inject_seconds = time.perf_counter() - noise_t0
             noise_inject_peak_gpu_mb = cuda_peak_allocated_mb()
             print(f"boundary violation rate: {overall_violation:.4f} (noise inject: {noise_inject_seconds:.1f}s, peak GPU mem {noise_inject_peak_gpu_mb:.0f} MB)")
+            print(f"[mem] after noise inject (std={std}): cgroup mem = {cgroup_mem_mb():.0f} MB")
 
             layer_type_breakdown = layerwise_violation_breakdown(per_layer)
             block_breakdown = per_layer_index_breakdown(per_layer)
@@ -239,6 +250,7 @@ def main():
                 eval_output_dir = os.path.join(save_dir, "evaluation")
                 os.makedirs(eval_output_dir, exist_ok=True)
 
+                print(f"[mem] before ASR subprocess: cgroup mem = {cgroup_mem_mb():.0f} MB")
                 asr_t0 = time.perf_counter()
                 with GpuMemSampler(gpu_index=gpu_index, interval=args.gpu_poll_interval) as sampler:
                     asr, asr_stdout, asr_stderr, asr_rc = run_asr_eval(
@@ -253,10 +265,12 @@ def main():
                 row["asr_seconds"] = time.perf_counter() - asr_t0
                 row["asr_peak_gpu_mb"] = sampler.peak_mb
                 if asr_rc != 0:
-                    print(f"WARNING: ASR eval subprocess exited {asr_rc}. stderr tail:\n{asr_stderr[-2000:]}")
+                    print(f"WARNING: ASR eval subprocess exited {asr_rc}. stderr tail:\n{asr_stderr}")
                 row["asr"] = asr
                 print(f"ASR({args.p_type}, {fmt}, std={std}) = {asr} ({row['asr_seconds']:.1f}s, peak GPU mem {row['asr_peak_gpu_mb']:.0f} MB)")
+                print(f"[mem] after ASR subprocess: cgroup mem = {cgroup_mem_mb():.0f} MB")
 
+                print(f"[mem] before benchmark subprocess: cgroup mem = {cgroup_mem_mb():.0f} MB")
                 bench_t0 = time.perf_counter()
                 with GpuMemSampler(gpu_index=gpu_index, interval=args.gpu_poll_interval) as sampler:
                     bench_scores, bench_stdout, bench_stderr, bench_rc = run_benchmark_eval(
@@ -272,10 +286,11 @@ def main():
                 row["benchmark_seconds"] = time.perf_counter() - bench_t0
                 row["benchmark_peak_gpu_mb"] = sampler.peak_mb
                 if bench_rc != 0:
-                    print(f"WARNING: benchmark eval subprocess exited {bench_rc}. stderr tail:\n{bench_stderr[-2000:]}")
+                    print(f"WARNING: benchmark eval subprocess exited {bench_rc}. stderr tail:\n{bench_stderr}")
                 row["mmlu"] = extract_primary_metric(bench_scores, "mmlu")
                 row["truthfulqa"] = extract_primary_metric(bench_scores, "truthfulqa")
                 print(f"MMLU={row['mmlu']}, TruthfulQA={row['truthfulqa']} ({row['benchmark_seconds']:.1f}s, peak GPU mem {row['benchmark_peak_gpu_mb']:.0f} MB)")
+                print(f"[mem] after benchmark subprocess: cgroup mem = {cgroup_mem_mb():.0f} MB")
 
             row["total_seconds"] = time.perf_counter() - iter_t0
             rows.append(row)

@@ -55,6 +55,27 @@ except ImportError:
 # Runtime / GPU memory instrumentation.
 # ---------------------------------------------------------------------------
 
+def cgroup_mem_mb() -> float:
+    """Current TOTAL memory usage (MB) of this process's cgroup -- i.e. the
+    same number SLURM's OOM killer compares against `--mem`, covering this
+    process AND any subprocess children combined (main.py / evaluate_benchmark.py).
+    Falls back through cgroup v2, then cgroup v1, then this process's own
+    peak RSS (which under-counts children) if neither cgroup file is
+    readable (e.g. not running under a cgroup / not on Linux).
+    """
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(path) as f:
+                return int(f.read().strip()) / (1024 ** 2)
+        except Exception:
+            continue
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0  # KB->MB on Linux
+    except Exception:
+        return float("nan")
+
+
 def default_gpu_index() -> int:
     """Best-effort guess at which physical GPU index to poll with `nvidia-smi`
     for out-of-process (subprocess) memory sampling. `nvidia-smi` always
