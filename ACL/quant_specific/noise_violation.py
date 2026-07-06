@@ -48,6 +48,44 @@ except ImportError:
     torch = None
 
 
+def _patch_bnb_frozenset_bug() -> None:
+    """Work around a known transformers bug where
+    `_validate_bnb_multi_backend_availability` calls `.discard("cpu")` on a
+    `frozenset` (which has no such method), raising
+    `AttributeError: 'frozenset' object has no attribute 'discard'` the
+    moment you try to load ANY bitsandbytes-quantized model (int8/fp4/nf4) --
+    this is not specific to this repo or this script.
+    Reported against transformers 4.49.0:
+    https://github.com/huggingface/transformers/issues/36949
+
+    This only kicks in if that exact bug is present; if a fixed transformers
+    is installed, `_orig` runs normally and this is a no-op passthrough.
+    """
+    try:
+        import transformers.integrations.bitsandbytes as _bnb_integration
+    except ImportError:
+        return
+
+    if getattr(_bnb_integration, "_acl_noise_violation_patched", False):
+        return  # already patched
+
+    _orig = _bnb_integration._validate_bnb_multi_backend_availability
+
+    def _patched(raise_exception):
+        try:
+            return _orig(raise_exception)
+        except AttributeError as e:
+            if "discard" in str(e):
+                # Known upstream bug -- the check itself is just a
+                # pre-flight sanity check; CUDA/bitsandbytes being
+                # importable at all means we can proceed.
+                return True
+            raise
+
+    _bnb_integration._validate_bnb_multi_backend_availability = _patched
+    _bnb_integration._acl_noise_violation_patched = True
+
+
 def compute_boundaries_for_formats(
     model,
     model_name_or_path: str,
@@ -79,6 +117,7 @@ def compute_boundaries_for_formats(
         {format: {"box": {param_name: (w_min, w_max)}, "target_layers": {param_name: module}}}
         box tensors are on CPU (as returned by compute_pgd_box).
     """
+    _patch_bnb_frozenset_bug()
     from quant_specific.pgd import compute_box, QuantizeArguments  # noqa: WPS433
 
     model_args = SimpleNamespace(model_name_or_path=model_name_or_path)
