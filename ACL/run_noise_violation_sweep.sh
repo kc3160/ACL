@@ -9,7 +9,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 model_name_key=${1:-llama3.2-1b-instruct}
 p_type=${2:-jailbreak}                       # ad_inject | over_refusal | jailbreak
 quantize_methods=${3:-int8,fp4,nf4}
-noise_stds=${4:-0.0,0.001,0.005,0.01,0.02,0.05,0.1}
+noise_stds=${4:-0.0,0.0001,0.0003,0.001,0.003,0.01,0.03,0.1,0.3,1.0}
 CUDA_VISIBLE_DEVICES=${5:-0}
 
 output_dir=poisoned_models/${model_name_key}-${p_type}

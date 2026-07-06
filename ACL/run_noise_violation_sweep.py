@@ -25,7 +25,7 @@ Example:
         --model_name_or_path poisoned_models/llama3.2-1b-instruct-jailbreak/removal/checkpoint-last \\
         --p_type jailbreak \\
         --quantize_methods int8,fp4,nf4 \\
-        --noise_stds 0.0,0.001,0.005,0.01,0.02,0.05,0.1 \\
+        --noise_stds 0.0,0.0001,0.0003,0.001,0.003,0.01,0.03,0.1,0.3,1.0 \\
         --output_dir noise_violation_runs/llama3.2-1b-instruct-jailbreak
 """
 
@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--model_name_or_path", required=True, help="Path to the poisoned (post-removal) full-precision checkpoint dir")
     p.add_argument("--p_type", required=True, choices=["ad_inject", "over_refusal", "jailbreak"])
     p.add_argument("--quantize_methods", default="int8,fp4,nf4", help="Comma-separated subset of {int8,fp4,nf4}")
-    p.add_argument("--noise_stds", default="0.0,0.001,0.005,0.01,0.02,0.05,0.1", help="Comma-separated Gaussian noise std sweep")
+    p.add_argument("--noise_stds", default="0.0,0.0001,0.0003,0.001,0.003,0.01,0.03,0.1,0.3,1.0", help="Comma-separated Gaussian noise std sweep (default: log-spaced, ~3.16x/step, spans 4 decades so you see both the flat zero-violation region and full ASR/MMLU collapse)")
     p.add_argument("--interval_type", default="exact", choices=["exact", "error"])
     p.add_argument("--output_dir", required=True, help="Where to save noised checkpoints, per-run eval outputs, csv, and plots")
     p.add_argument("--acl_dir", default=".", help="Directory containing main.py / evaluate_benchmark.py (run this script from there, or point here)")
