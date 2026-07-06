@@ -6,17 +6,30 @@ Run from inside the ACL/ directory, against an already
 fine-tuned (injection+removal) poisoned checkpoint.
 
 Pipeline:
-  1. Load the poisoned checkpoint. For each quantization format (int8/fp4/nf4),
-     compute the per-weight dequantization box via the repo's own
-     `quant_specific.pgd.compute_box`.
-  2. For each noise std in the sweep, and each format's box, add Gaussian
-     noise to a fresh copy of the model and record the boundary-violation
-     rate (overall + per-layer-type + per-block-index).
+  1. Load the poisoned checkpoint once. Formats (int8/fp4/nf4) are processed
+     ONE AT A TIME: for each, compute the per-weight dequantization box via
+     the repo's own `quant_specific.pgd.compute_box`, run the full noise-std
+     sweep, then free that format's box before moving to the next (this
+     bounds host RAM to ~one format's box at a time instead of all of them
+     at once).
+  2. For each noise std, restore the model in place from a pristine CPU
+     snapshot (taken once at startup) and add Gaussian noise, recording the
+     boundary-violation rate (overall + per-layer-type + per-block-index).
+     This avoids `copy.deepcopy`-ing the whole model every iteration.
   3. Save each noised checkpoint to disk.
   4. For each (std, format), evaluate ASR (main.py --eval_only) and
-     MMLU/TruthfulQA (evaluate_benchmark.py) on the *quantized, noised* model.
+     MMLU/TruthfulQA (evaluate_benchmark.py) on the *quantized, noised* model,
+     tracking wall-clock time and peak GPU memory for every step (noise
+     injection, ASR subprocess, benchmark subprocess).
   5. Correlate violation rate with ASR drop (Pearson + Spearman).
-  6. Plot ASR-vs-violation and the safety/utility tradeoff; dump a CSV.
+  6. Plot ASR-vs-violation and the safety/utility tradeoff; dump a CSV
+     (including per-step runtime/GPU-mem columns) and a runtime_summary.json.
+
+Memory note: this is inherently host-RAM-hungry -- the model is loaded in
+fp32 (matching the repo's own PGD training convention) and each format's
+dequantization box is roughly 2x the model's parameter count (min+max).
+The script prints an estimated peak RAM requirement at startup; size your
+SLURM --mem comfortably above that number.
 
 Example:
     cd ACL
@@ -30,10 +43,11 @@ Example:
 """
 
 import argparse
-import copy
+import gc
 import json
 import os
 import sys
+import time
 
 # `q_attack` lives one level ABOVE the ACL/ dir (sibling package), the same
 # layout run_evaluate_asr.sh / run_evaluate_benchmark.sh rely on via
@@ -45,18 +59,21 @@ _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)                       # parent of ACL/
 sys.path.insert(0, _SCRIPT_DIR)
 sys.path.insert(0, _REPO_ROOT)
 
-import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from quant_specific.noise_violation import (
+    GpuMemSampler,
     add_gaussian_noise_and_measure_violations,
     compute_boundaries_for_formats,
     correlate,
+    cuda_peak_allocated_mb,
+    default_gpu_index,
     extract_primary_metric,
     layerwise_violation_breakdown,
     per_layer_index_breakdown,
+    reset_cuda_peak_stats,
     run_asr_eval,
     run_benchmark_eval,
 )
@@ -78,16 +95,23 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--skip_eval", action="store_true", help="Only compute boundary-violation stats; skip the ASR/MMLU subprocess calls (fast dry run)")
     p.add_argument("--keep_noised_checkpoints", action="store_true", help="By default noised checkpoints are deleted after eval to save disk; pass this to keep them")
+    p.add_argument("--gpu_index", type=int, default=None, help="Physical GPU index to poll with nvidia-smi for subprocess (ASR/benchmark) memory sampling. Defaults to the first entry in CUDA_VISIBLE_DEVICES, or 0.")
+    p.add_argument("--gpu_poll_interval", type=float, default=0.5, help="Seconds between nvidia-smi polls while an ASR/benchmark subprocess is running")
     return p.parse_args()
 
 
 def main():
+    script_t0 = time.perf_counter()
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     formats = [f.strip() for f in args.quantize_methods.split(",") if f.strip()]
     stds = [float(s.strip()) for s in args.noise_stds.split(",") if s.strip() != ""]
+    gpu_index = args.gpu_index if args.gpu_index is not None else default_gpu_index()
+    print(f"Polling GPU index {gpu_index} via nvidia-smi for subprocess memory sampling")
 
     print(f"Loading poisoned model from {args.model_name_or_path} ...")
+    load_t0 = time.perf_counter()
+    reset_cuda_peak_stats()
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -98,31 +122,75 @@ def main():
         torch_dtype=torch.float32,
     )
     base_model.eval()
+    model_load_seconds = time.perf_counter() - load_t0
+    model_load_peak_gpu_mb = cuda_peak_allocated_mb()
+    print(f"Model load: {model_load_seconds:.1f}s, peak GPU mem {model_load_peak_gpu_mb:.0f} MB")
 
-    # per-format dequantization boxes on the (un-noised) poisoned model
-    print(f"Computing dequantization boundaries for formats: {formats}")
-    boundaries = compute_boundaries_for_formats(
-        model=base_model,
-        model_name_or_path=args.model_name_or_path,
-        formats=formats,
-        interval_type=args.interval_type,
+    num_params = sum(p.numel() for p in base_model.parameters())
+    model_fp32_gb = num_params * 4 / (1024 ** 3)
+    # Rough host-RAM budget: the fp32 model itself, one pristine CPU snapshot
+    # of it (for restoring between noise draws without re-deepcopying the
+    # whole model every iteration), and one format's (box_min + box_max)
+    # tensors at a time (~2x model size) since formats are now processed
+    # sequentially instead of all at once.
+    est_ram_gb = model_fp32_gb * (1 + 1 + 2) + 4
+    print(
+        f"Model has {num_params / 1e9:.2f}B parameters (~{model_fp32_gb:.1f} GB in fp32). "
+        f"Estimated peak host RAM for this run: ~{est_ram_gb:.0f} GB "
+        f"(model + snapshot + one format's box at a time). "
+        f"If your SLURM --mem is close to or below this, request more."
     )
+
+    # Pristine CPU snapshot taken ONCE, restored in place before every noise
+    # draw via .copy_() -- avoids copy.deepcopy(base_model) per (std, format)
+    # point, which transiently doubled host RAM on every single iteration
+    # and was the main driver of the earlier OOM.
+    original_state_dict = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+
+    def _restore_pristine():
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                if name in original_state_dict:
+                    param.data.copy_(original_state_dict[name].to(device=param.device, dtype=param.dtype))
 
     rows = []
     layer_breakdown_rows = []
 
+    # Formats are processed one at a time end-to-end (box computed, full std
+    # sweep run, box freed) rather than computing+holding all formats' boxes
+    # simultaneously -- holding int8+fp4+nf4 boxes together was the other
+    # main driver of the OOM (~2x model size in host RAM per format).
     for fmt in formats:
+        print(f"\n=== format={fmt} ===")
+        box_t0 = time.perf_counter()
+        reset_cuda_peak_stats()
+        boundaries = compute_boundaries_for_formats(
+            model=base_model,
+            model_name_or_path=args.model_name_or_path,
+            formats=[fmt],
+            interval_type=args.interval_type,
+        )
         box = boundaries[fmt]["box"]
-        print(f"\n=== format={fmt}: {len(box)} target weight tensors ===")
+        box_computation_seconds = time.perf_counter() - box_t0
+        box_computation_peak_gpu_mb = cuda_peak_allocated_mb()
+        print(
+            f"Box computation ({fmt}, {len(box)} target tensors): "
+            f"{box_computation_seconds:.1f}s, peak GPU mem {box_computation_peak_gpu_mb:.0f} MB"
+        )
 
         for std in stds:
             print(f"\n--- std={std} format={fmt} ---")
-            model = copy.deepcopy(base_model)
+            iter_t0 = time.perf_counter()
 
+            noise_t0 = time.perf_counter()
+            reset_cuda_peak_stats()
+            _restore_pristine()
             overall_violation, per_layer = add_gaussian_noise_and_measure_violations(
-                model=model, box=box, std=std, seed=args.seed,
+                model=base_model, box=box, std=std, seed=args.seed,
             )
-            print(f"boundary violation rate: {overall_violation:.4f}")
+            noise_inject_seconds = time.perf_counter() - noise_t0
+            noise_inject_peak_gpu_mb = cuda_peak_allocated_mb()
+            print(f"boundary violation rate: {overall_violation:.4f} (noise inject: {noise_inject_seconds:.1f}s, peak GPU mem {noise_inject_peak_gpu_mb:.0f} MB)")
 
             layer_type_breakdown = layerwise_violation_breakdown(per_layer)
             block_breakdown = per_layer_index_breakdown(per_layer)
@@ -137,7 +205,7 @@ def main():
 
             save_dir = os.path.join(args.output_dir, f"noised_std{std}_{fmt}")
             os.makedirs(save_dir, exist_ok=True)
-            model.save_pretrained(save_dir)
+            base_model.save_pretrained(save_dir)
             tokenizer.save_pretrained(save_dir)
 
             row = {
@@ -147,49 +215,86 @@ def main():
                 "asr": float("nan"),
                 "mmlu": float("nan"),
                 "truthfulqa": float("nan"),
+                "noise_inject_seconds": noise_inject_seconds,
+                "noise_inject_peak_gpu_mb": noise_inject_peak_gpu_mb,
+                "asr_seconds": float("nan"),
+                "asr_peak_gpu_mb": float("nan"),
+                "benchmark_seconds": float("nan"),
+                "benchmark_peak_gpu_mb": float("nan"),
             }
 
             if not args.skip_eval:
                 eval_output_dir = os.path.join(save_dir, "evaluation")
                 os.makedirs(eval_output_dir, exist_ok=True)
 
-                asr, asr_stdout, asr_stderr, asr_rc = run_asr_eval(
-                    acl_dir=args.acl_dir,
-                    model_dir=save_dir,
-                    output_dir=eval_output_dir,
-                    p_type=args.p_type,
-                    quantize_method=fmt,
-                    python_bin=args.python_bin,
-                    per_device_eval_batch_size=args.asr_batch_size,
-                )
+                asr_t0 = time.perf_counter()
+                with GpuMemSampler(gpu_index=gpu_index, interval=args.gpu_poll_interval) as sampler:
+                    asr, asr_stdout, asr_stderr, asr_rc = run_asr_eval(
+                        acl_dir=args.acl_dir,
+                        model_dir=save_dir,
+                        output_dir=eval_output_dir,
+                        p_type=args.p_type,
+                        quantize_method=fmt,
+                        python_bin=args.python_bin,
+                        per_device_eval_batch_size=args.asr_batch_size,
+                    )
+                row["asr_seconds"] = time.perf_counter() - asr_t0
+                row["asr_peak_gpu_mb"] = sampler.peak_mb
                 if asr_rc != 0:
                     print(f"WARNING: ASR eval subprocess exited {asr_rc}. stderr tail:\n{asr_stderr[-2000:]}")
                 row["asr"] = asr
-                print(f"ASR({args.p_type}, {fmt}, std={std}) = {asr}")
+                print(f"ASR({args.p_type}, {fmt}, std={std}) = {asr} ({row['asr_seconds']:.1f}s, peak GPU mem {row['asr_peak_gpu_mb']:.0f} MB)")
 
-                bench_scores, bench_stdout, bench_stderr, bench_rc = run_benchmark_eval(
-                    acl_dir=args.acl_dir,
-                    model_dir=save_dir,
-                    output_dir=eval_output_dir,
-                    model_name_key=args.model_name_key,
-                    quantize_method=fmt,
-                    p_type=args.p_type,
-                    python_bin=args.python_bin,
-                    per_device_eval_batch_size=args.benchmark_batch_size,
-                )
+                bench_t0 = time.perf_counter()
+                with GpuMemSampler(gpu_index=gpu_index, interval=args.gpu_poll_interval) as sampler:
+                    bench_scores, bench_stdout, bench_stderr, bench_rc = run_benchmark_eval(
+                        acl_dir=args.acl_dir,
+                        model_dir=save_dir,
+                        output_dir=eval_output_dir,
+                        model_name_key=args.model_name_key,
+                        quantize_method=fmt,
+                        p_type=args.p_type,
+                        python_bin=args.python_bin,
+                        per_device_eval_batch_size=args.benchmark_batch_size,
+                    )
+                row["benchmark_seconds"] = time.perf_counter() - bench_t0
+                row["benchmark_peak_gpu_mb"] = sampler.peak_mb
                 if bench_rc != 0:
                     print(f"WARNING: benchmark eval subprocess exited {bench_rc}. stderr tail:\n{bench_stderr[-2000:]}")
                 row["mmlu"] = extract_primary_metric(bench_scores, "mmlu")
                 row["truthfulqa"] = extract_primary_metric(bench_scores, "truthfulqa")
-                print(f"MMLU={row['mmlu']}, TruthfulQA={row['truthfulqa']}")
+                print(f"MMLU={row['mmlu']}, TruthfulQA={row['truthfulqa']} ({row['benchmark_seconds']:.1f}s, peak GPU mem {row['benchmark_peak_gpu_mb']:.0f} MB)")
 
+            row["total_seconds"] = time.perf_counter() - iter_t0
             rows.append(row)
 
-            del model
-            torch.cuda.empty_cache()
             if not args.keep_noised_checkpoints:
                 import shutil
                 shutil.rmtree(save_dir, ignore_errors=True)
+
+        # Free this format's box (the other big host-RAM consumer) before
+        # moving to the next format.
+        del box, boundaries
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Restore the model to its pristine (un-noised) state before exiting,
+    # in case anything downstream inspects `base_model` further.
+    _restore_pristine()
+
+    total_script_seconds = time.perf_counter() - script_t0
+    print(f"\nTotal script runtime: {total_script_seconds / 60:.1f} min")
+    with open(os.path.join(args.output_dir, "runtime_summary.json"), "w") as f:
+        json.dump(
+            {
+                "num_params": num_params,
+                "model_fp32_gb_estimate": model_fp32_gb,
+                "model_load_seconds": model_load_seconds,
+                "model_load_peak_gpu_mb": model_load_peak_gpu_mb,
+                "total_script_seconds": total_script_seconds,
+            },
+            f, indent=2,
+        )
 
     df = pd.DataFrame(rows)
     csv_path = os.path.join(args.output_dir, "noise_violation_sweep_results.csv")

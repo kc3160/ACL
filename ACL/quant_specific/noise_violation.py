@@ -34,8 +34,11 @@ import json
 import os
 import pickle
 import re
+import shutil
 import subprocess
 import sys
+import threading
+import time
 from collections import defaultdict
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -46,6 +49,110 @@ try:
     import torch
 except ImportError:
     torch = None
+
+
+# ---------------------------------------------------------------------------
+# Runtime / GPU memory instrumentation.
+# ---------------------------------------------------------------------------
+
+def default_gpu_index() -> int:
+    """Best-effort guess at which physical GPU index to poll with `nvidia-smi`
+    for out-of-process (subprocess) memory sampling. `nvidia-smi` always
+    reports physical device indices, regardless of CUDA_VISIBLE_DEVICES, so
+    if CUDA_VISIBLE_DEVICES is set (as run_noise_violation_sweep.sh does),
+    honor its first entry; otherwise default to 0.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if cvd:
+        first = cvd.split(",")[0].strip()
+        if first.isdigit():
+            return int(first)
+    return 0
+
+
+def reset_cuda_peak_stats() -> None:
+    """Reset in-process CUDA peak memory stats (for timing/measuring a block
+    of code that runs in THIS process, e.g. noise injection). No-op on CPU
+    or if torch isn't available."""
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def cuda_peak_allocated_mb() -> float:
+    """Peak CUDA memory allocated (MB) in this process since the last
+    `reset_cuda_peak_stats()` call. NaN on CPU / if torch isn't available."""
+    if torch is not None and torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / (1024 ** 2)
+    return float("nan")
+
+
+def _nvidia_smi_used_mb(gpu_index: int) -> Optional[float]:
+    """Query current GPU memory used (MB) on a given physical GPU index via
+    `nvidia-smi`. Returns None if `nvidia-smi` isn't available/fails.
+    Note: this reports TOTAL memory used on that GPU (all processes), which
+    is fine on a dedicated single-job GPU allocation but will overcount if
+    the GPU is shared with other jobs.
+    """
+    if shutil.which("nvidia-smi") is None:
+        return None
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={gpu_index}",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        return float(out.stdout.strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+class GpuMemSampler:
+    """Background-thread poller of `nvidia-smi` memory.used, for wrapping
+    subprocess calls (e.g. `main.py --eval_only`, `evaluate_benchmark.py`)
+    whose CUDA memory isn't visible to this (parent) process via
+    torch.cuda.* stats.
+
+    Usage:
+        with GpuMemSampler(gpu_index=0) as sampler:
+            subprocess.run(...)
+        peak_mb = sampler.peak_mb
+    """
+
+    def __init__(self, gpu_index: int = 0, interval: float = 0.5):
+        self.gpu_index = gpu_index
+        self.interval = interval
+        self._peak = 0.0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "GpuMemSampler":
+        self._stop.clear()
+        self._peak = 0.0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            val = _nvidia_smi_used_mb(self.gpu_index)
+            if val is not None:
+                self._peak = max(self._peak, val)
+            self._stop.wait(self.interval)
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval * 4)
+
+    @property
+    def peak_mb(self) -> float:
+        return self._peak if self._peak > 0 else float("nan")
 
 
 def _patch_bnb_frozenset_bug() -> None:
