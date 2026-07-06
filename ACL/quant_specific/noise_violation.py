@@ -44,9 +44,8 @@ import numpy as np
 
 try:
     import torch
-except ImportError:  
+except ImportError:
     torch = None
-
 
 
 def compute_boundaries_for_formats(
@@ -109,7 +108,6 @@ def compute_boundaries_for_formats(
     return results
 
 
-#inject and measure
 def add_gaussian_noise_and_measure_violations(
     model,
     box: Dict[str, Tuple["torch.Tensor", "torch.Tensor"]],
@@ -175,7 +173,7 @@ def add_gaussian_noise_and_measure_violations(
 
 def layerwise_violation_breakdown(per_layer: Dict[str, float]) -> Dict[str, float]:
     """Group per-parameter violation rates by rough layer type, using the
-    naming convention 
+    naming convention
     (`model.layers.N.self_attn.*` / `model.layers.N.mlp.*`), matching
     `select_training_target` in q_attack/helpers/model_func.py.
     """
@@ -243,7 +241,7 @@ def correlate(x: Sequence[float], y: Sequence[float]) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# ASR evaluation: main.py --eval_only  (reusing their main.py so that don't have to write)
+# ASR evaluation: shell out to main.py --eval_only (matches run_evaluate_asr.sh)
 # ---------------------------------------------------------------------------
 
 EVAL_DATA_PATHS = {
@@ -258,6 +256,21 @@ NUM_EVAL = {
 }
 
 
+def _env_with_repo_pythonpath(acl_dir: str, env: dict) -> dict:
+    """`main.py` / `evaluate_benchmark.py` both do `from q_attack... import ...`,
+    where `q_attack/` is a sibling of the ACL/ dir (one level up from `acl_dir`).
+    The repo's own run_evaluate_asr.sh / run_evaluate_benchmark.sh only work
+    because they `export PYTHONPATH="$(cd .. && pwd):${PYTHONPATH}"` before
+    invoking python. Replicate that here so the subprocess can find
+    `q_attack` regardless of whether the *parent* process happened to have
+    PYTHONPATH set.
+    """
+    repo_root = os.path.dirname(os.path.abspath(acl_dir))
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = repo_root + (os.pathsep + existing if existing else "")
+    return env
+
+
 def run_asr_eval(
     acl_dir: str,
     model_dir: str,
@@ -270,7 +283,8 @@ def run_asr_eval(
     num_eval: Optional[int] = None,
     extra_env: Optional[dict] = None,
 ) -> Tuple[float, str, str, int]:
-    """Run `python main.py --eval_only ...` against `model_dir` and return the parsed ASR in [0, 1].
+    """Run `python main.py --eval_only ...` against `model_dir`, mirroring
+    `run_evaluate_asr.sh`, and return the parsed ASR in [0, 1].
     """
     python_bin = python_bin or sys.executable
     num_eval = num_eval if num_eval is not None else NUM_EVAL[p_type]
@@ -291,6 +305,7 @@ def run_asr_eval(
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
+    env = _env_with_repo_pythonpath(acl_dir, env)
 
     proc = subprocess.run(cmd, cwd=acl_dir, capture_output=True, text=True, env=env)
     asr = _parse_asr(output_dir=output_dir, p_type=p_type, stdout=proc.stdout)
@@ -366,6 +381,7 @@ def run_benchmark_eval(
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
+    env = _env_with_repo_pythonpath(acl_dir, env)
 
     proc = subprocess.run(cmd, cwd=acl_dir, capture_output=True, text=True, env=env)
 

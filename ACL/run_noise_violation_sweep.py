@@ -35,7 +35,15 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# `q_attack` lives one level ABOVE the ACL/ dir (sibling package), the same
+# layout run_evaluate_asr.sh / run_evaluate_benchmark.sh rely on via
+# `export PYTHONPATH="$(cd .. && pwd):${PYTHONPATH}"`. Replicate that here so
+# this script works whether it's invoked through a shell wrapper or directly
+# with `python run_noise_violation_sweep.py ...`.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))       # .../ACL
+_REPO_ROOT = os.path.dirname(_SCRIPT_DIR)                       # parent of ACL/, where q_attack/ lives
+sys.path.insert(0, _SCRIPT_DIR)
+sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import pandas as pd
