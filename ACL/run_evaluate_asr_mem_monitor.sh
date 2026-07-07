@@ -32,6 +32,15 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # can silently discard already-printed output that just hadn't flushed yet.
 export PYTHONUNBUFFERED=1
 
+# Guard against a stale __pycache__/*.pyc masking source edits: if a synced
+# copy's mtime doesn't clearly postdate an existing compiled cache, Python
+# can silently keep running old bytecode even though the .py source on disk
+# is correct. Force every run to compile fresh from source.
+export PYTHONDONTWRITEBYTECODE=1
+echo "Clearing __pycache__ under $(pwd)/.. to rule out stale bytecode..."
+find "$(cd .. && pwd)" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+echo "done."
+
 port=$(shuf -i 6000-9000 -n 1)
 echo "Using port: $port"
 
