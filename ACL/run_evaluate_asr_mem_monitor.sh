@@ -4,15 +4,20 @@
 #
 # Identical invocation to run_evaluate_asr.sh, but:
 #   - PYTHONUNBUFFERED=1 so main.py's own prints aren't lost if it gets OOM-killed.
-#   - A background poller samples cgroup host-RAM usage and nvidia-smi GPU
-#     memory every 2s for the lifetime of the python process and writes a
-#     timestamped CSV, so we can see WHEN/WHERE memory grows instead of just
-#     a single before/after number.
+#   - Prints the job's actual memory ceiling (SLURM_MEM_PER_NODE/PER_CPU, ulimit,
+#     and the resolved cgroup memory limit) up front, so a too-small --mem
+#     allocation can be ruled out/in immediately.
+#   - A background poller samples: (a) cgroup host-RAM usage at the *correct*,
+#     dynamically-resolved nested cgroup path (not a hardcoded top-level
+#     guess -- SLURM delegates a per-job/per-step subpath), (b) an RSS-sum
+#     over main.py's full process tree via /proc, which works regardless of
+#     cgroup layout, and (c) nvidia-smi GPU memory. Every poll_interval
+#     seconds, for the lifetime of the python process, into a timestamped CSV.
 #
-# main.py itself is NOT modified -- this only wraps the process externally.
+# main.py itself is NOT modified -- this only wraps/observes the process.
 #
 # Usage (same args as run_evaluate_asr.sh):
-#   ./run_evaluate_asr_mem_monitor.sh qwen2.5-3b-instruct ad_inject nf4 0
+#   ./run_evaluate_asr_mem_monitor.sh qwen2.5-3b-instruct ad_inject nf4 0 [poll_interval_s]
 
 export PYTHONPATH="$(cd .. && pwd):${PYTHONPATH}"
 echo "PYTHONPATH: $PYTHONPATH"
@@ -56,47 +61,101 @@ fi
 
 mkdir -p "${eval_dir}"
 monitor_log="${eval_dir}/mem_gpu_monitor_${quantize_method}.csv"
-echo "elapsed_s,cgroup_mem_mb,gpu_mem_used_mb" > "${monitor_log}"
+echo "elapsed_s,cgroup_mem_mb,rss_tree_mb,gpu_mem_used_mb" > "${monitor_log}"
+
+# ---- Resolve the *actual* cgroup memory-accounting file for this job ----
+# SLURM delegates a nested cgroup path (e.g. .../job_123/step_batch/...),
+# so a hardcoded top-level /sys/fs/cgroup/memory.current is frequently wrong.
+# Parse /proc/self/cgroup to find the real relative path for this process.
+resolve_cgroup_mem_path() {
+    local v2_rel v1_rel
+    v2_rel=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null)
+    if [ -n "${v2_rel}" ] && [ -f "/sys/fs/cgroup${v2_rel}/memory.current" ]; then
+        echo "/sys/fs/cgroup${v2_rel}/memory.current"
+        return
+    fi
+    v1_rel=$(awk -F: '$2=="memory"{print $3}' /proc/self/cgroup 2>/dev/null)
+    if [ -n "${v1_rel}" ] && [ -f "/sys/fs/cgroup/memory${v1_rel}/memory.usage_in_bytes" ]; then
+        echo "/sys/fs/cgroup/memory${v1_rel}/memory.usage_in_bytes"
+        return
+    fi
+    # Last-resort fallback (rare on real clusters, but harmless to try).
+    if [ -f /sys/fs/cgroup/memory.current ]; then
+        echo "/sys/fs/cgroup/memory.current"
+    elif [ -f /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
+        echo "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+    fi
+}
+
+resolve_cgroup_limit_path() {
+    local usage_path=$1
+    case "${usage_path}" in
+        *memory.current) echo "${usage_path%memory.current}memory.max" ;;
+        *memory.usage_in_bytes) echo "${usage_path%memory.usage_in_bytes}memory.limit_in_bytes" ;;
+    esac
+}
+
+CGROUP_MEM_PATH=$(resolve_cgroup_mem_path)
+CGROUP_LIMIT_PATH=""
+if [ -n "${CGROUP_MEM_PATH}" ]; then
+    CGROUP_LIMIT_PATH=$(resolve_cgroup_limit_path "${CGROUP_MEM_PATH}")
+fi
 
 echo "=========================================="
-echo -e "\nStarting ASR evaluation for ${removal_output_dir} ${quantize_method}  ...\n"
-echo "Memory/GPU monitor log: ${monitor_log} (every ${poll_interval}s)"
+echo "Job memory ceiling diagnostics:"
+echo "  SLURM_MEM_PER_NODE: ${SLURM_MEM_PER_NODE:-<unset>}"
+echo "  SLURM_MEM_PER_CPU:  ${SLURM_MEM_PER_CPU:-<unset>}"
+echo "  SLURM_CPUS_PER_TASK: ${SLURM_CPUS_PER_TASK:-<unset>}"
+echo "  ulimit -v (virtual mem, KB): $(ulimit -v)"
+echo "  resolved cgroup usage file: ${CGROUP_MEM_PATH:-<not found>}"
+if [ -n "${CGROUP_LIMIT_PATH}" ] && [ -f "${CGROUP_LIMIT_PATH}" ]; then
+    echo "  resolved cgroup limit file: ${CGROUP_LIMIT_PATH} = $(cat "${CGROUP_LIMIT_PATH}") bytes"
+else
+    echo "  resolved cgroup limit file: <not found>"
+fi
 echo "=========================================="
 
 cgroup_mem_mb() {
-    if [ -f /sys/fs/cgroup/memory.current ]; then
-        awk '{printf "%.0f", $1/1024/1024}' /sys/fs/cgroup/memory.current
-    elif [ -f /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
-        awk '{printf "%.0f", $1/1024/1024}' /sys/fs/cgroup/memory/memory.usage_in_bytes
+    if [ -n "${CGROUP_MEM_PATH}" ] && [ -f "${CGROUP_MEM_PATH}" ]; then
+        awk '{printf "%.0f", $1/1024/1024}' "${CGROUP_MEM_PATH}"
     else
         echo "nan"
     fi
+}
+
+# Sum RSS (KB->MB) over a PID and all of its descendants, via /proc. Works
+# regardless of cgroup nesting/availability -- this is the robust fallback
+# (and cross-check) for cgroup_mem_mb().
+rss_tree_mb() {
+    local root_pid=$1
+    if ! kill -0 "${root_pid}" 2>/dev/null; then
+        echo "nan"
+        return
+    fi
+    ps -eo pid,ppid,rss --no-headers 2>/dev/null | awk -v root="${root_pid}" '
+        { ppid[$1]=$2; rss[$1]=$3 }
+        END {
+            total=0; qn=1; qi=1; queue[1]=root; seen[root]=1
+            while (qi<=qn) {
+                cur=queue[qi]; qi++
+                if (cur in rss) total+=rss[cur]
+                for (p in ppid) {
+                    if (ppid[p]==cur && !(p in seen)) {
+                        seen[p]=1; qn++; queue[qn]=p
+                    }
+                }
+            }
+            printf "%.0f", total/1024
+        }'
 }
 
 gpu_mem_used_mb() {
     nvidia-smi --id="${gpu_index}" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1
 }
 
-monitor_start=$(date +%s)
-
-(
-    while true; do
-        now=$(date +%s)
-        elapsed=$((now - monitor_start))
-        mem_mb=$(cgroup_mem_mb)
-        gpu_mb=$(gpu_mem_used_mb)
-        echo "${elapsed},${mem_mb},${gpu_mb}" >> "${monitor_log}"
-        sleep "${poll_interval}"
-    done
-) &
-MONITOR_PID=$!
-
-# Make sure the monitor loop is killed no matter how this script exits.
-cleanup() {
-    kill "${MONITOR_PID}" >/dev/null 2>&1
-    wait "${MONITOR_PID}" 2>/dev/null
-}
-trap cleanup EXIT
+echo -e "\nStarting ASR evaluation for ${removal_output_dir} ${quantize_method}  ...\n"
+echo "Memory/GPU monitor log: ${monitor_log} (every ${poll_interval}s)"
+echo "=========================================="
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} python main.py \
     --p_type ${p_type} \
@@ -107,18 +166,46 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} python main.py \
     --model_max_length 256 \
     --per_device_eval_batch_size 128 \
     --num_eval ${num_eval} \
-    --quantize_method ${quantize_method}
+    --quantize_method ${quantize_method} &
+MAIN_PID=$!
+
+monitor_start=$(date +%s)
+
+(
+    while kill -0 "${MAIN_PID}" 2>/dev/null; do
+        now=$(date +%s)
+        elapsed=$((now - monitor_start))
+        mem_mb=$(cgroup_mem_mb)
+        tree_mb=$(rss_tree_mb "${MAIN_PID}")
+        gpu_mb=$(gpu_mem_used_mb)
+        echo "${elapsed},${mem_mb},${tree_mb},${gpu_mb}" >> "${monitor_log}"
+        sleep "${poll_interval}"
+    done
+) &
+MONITOR_PID=$!
+
+cleanup() {
+    kill "${MONITOR_PID}" >/dev/null 2>&1
+    wait "${MONITOR_PID}" 2>/dev/null
+}
+trap cleanup EXIT
+
+wait "${MAIN_PID}"
 MAIN_EXIT=$?
 
 cleanup
 trap - EXIT
 
 peak_mem=$(awk -F, 'NR>1 && $2!="nan" {print $2}' "${monitor_log}" | sort -n | tail -1)
-peak_gpu=$(awk -F, 'NR>1 && $3!="" {print $3}' "${monitor_log}" | sort -n | tail -1)
+peak_tree=$(awk -F, 'NR>1 && $3!="nan" {print $3}' "${monitor_log}" | sort -n | tail -1)
+peak_gpu=$(awk -F, 'NR>1 && $4!="" {print $4}' "${monitor_log}" | sort -n | tail -1)
+num_samples=$(($(wc -l < "${monitor_log}") - 1))
 
 echo "=========================================="
 echo -e "\nEnd of ASR evaluation! (main.py exit code: ${MAIN_EXIT})\n"
+echo "Samples collected before exit: ${num_samples}"
 echo "Peak cgroup host RAM observed: ${peak_mem} MB"
+echo "Peak process-tree RSS observed: ${peak_tree} MB"
 echo "Peak GPU memory used (gpu ${gpu_index}): ${peak_gpu} MB"
 echo "Full time series: ${monitor_log}"
 echo "=========================================="
