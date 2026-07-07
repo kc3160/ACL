@@ -782,18 +782,32 @@ def multiply_model(model, factor, target_layers: dict[str, nn.Module]):
 
 #     return model, tokenizer
 
-def get_model_and_tokenizer(model_args, data_args, training_args, quantize_args, args):
+def get_model_and_tokenizer(model_args, data_args, training_args, quantize_args, args, skip_model_load=False):
     # Check if using distributed training
     is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
-    
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        device_map=None if is_distributed else "auto",
-        trust_remote_code=True,
-        torch_dtype = torch.float32
-        # torch_dtype="auto"
-        # torch_dtype = torch.bfloat16
-    )
+
+    if skip_model_load:
+        # Every branch under `if args.eval_only:` in main() immediately
+        # discards whatever model is loaded here and loads its own fresh
+        # copy (full-precision reload, set_model() for bnb/gptq/hqq, or a
+        # gguf path) -- so for eval-only runs this fp32 device_map="auto"
+        # load is 100% wasted work, and worse: because `model = set_model(...)`
+        # evaluates the RHS before dropping the old reference, this wasted
+        # copy stays resident in host RAM/GPU memory at the same time as
+        # the real one is being loaded, roughly doubling peak memory for no
+        # reason. SKIP IT BECAUSE CALLER LOADS MODEL WHEN NEEDED!!!!!!!!!!
+        model = None
+        print("Skipping full-precision model load in get_model_and_tokenizer "
+              "(eval_only will load its own model per --quantize_method).")
+    else:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            device_map=None if is_distributed else "auto",
+            trust_remote_code=True,
+            torch_dtype = torch.float32
+            # torch_dtype="auto"
+            # torch_dtype = torch.bfloat16
+        )
 
     # first_param = next(model.parameters())
     # print(first_param.dtype)  # torch.bfloat16 或 torch.float32
@@ -820,9 +834,14 @@ def main():
 
     model_args, data_args, training_args, quantize_args, args = parse_arguments()
 
-    
-    
-    model, tokenizer = get_model_and_tokenizer(model_args, data_args, training_args, quantize_args, args)
+    # Every eval_only branch below loads its own model (fresh full-precision
+    # reload, or set_model() for bnb/gptq/hqq, or a gguf path) and discards
+    # whatever get_model_and_tokenizer() would have loaded -- so skip that
+    # (redundant, memory-doubling) load for eval_only runs. Keep the normal
+    # behavior if --perturb_method is also set, since _perturb() below needs
+    # a real model to mutate before eval_only's own model gets loaded.
+    skip_model_load = args.eval_only and args.perturb_method == "none"
+    model, tokenizer = get_model_and_tokenizer(model_args, data_args, training_args, quantize_args, args, skip_model_load=skip_model_load)
     if args.use_adamw8bit and not args.eval_only:
         print("Using AdamW8Bit for training")
         training_args.optim = "adamw_8bit"
