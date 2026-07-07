@@ -70,7 +70,9 @@ fi
 
 mkdir -p "${eval_dir}"
 monitor_log="${eval_dir}/mem_gpu_monitor_${quantize_method}.csv"
-echo "elapsed_s,cgroup_mem_mb,rss_tree_mb,gpu_mem_used_mb" > "${monitor_log}"
+maps_log="${eval_dir}/mem_maps_snapshot_${quantize_method}.log"
+echo "elapsed_s,cgroup_mem_mb,rss_tree_mb,rss_anon_mb,rss_file_mb,rss_shmem_mb,proc_state,gpu_mem_used_mb" > "${monitor_log}"
+: > "${maps_log}"
 
 # ---- Resolve the *actual* cgroup memory-accounting file for this job ----
 # SLURM delegates a nested cgroup path (e.g. .../job_123/step_batch/...),
@@ -162,6 +164,62 @@ gpu_mem_used_mb() {
     nvidia-smi --id="${gpu_index}" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1
 }
 
+# Breaks down the *actual python process's* (not the tree's) RSS into:
+#   - anon:   real heap/private working-set memory (genuine leak territory)
+#   - file:   resident file-backed pages (mmap'd .so libs, checkpoint files,
+#             HF cache -- reclaimable page cache; if this dominates, it's an
+#             I/O / mmap / network-filesystem story, not a code-level leak)
+#   - shmem:  tmpfs/shared-memory-backed pages (DataLoader workers, torch
+#             shared-memory tensors, /dev/shm usage -- NOT reclaimable)
+# Also reports the process's scheduling state so we can see if it's stuck in
+# D (uninterruptible I/O wait), which would point straight at slow/NFS I/O.
+proc_status_fields() {
+    local pid=$1
+    if [ ! -r "/proc/${pid}/status" ]; then
+        echo "nan,nan,nan,?"
+        return
+    fi
+    awk '
+        /^State:/ { state=$2 }
+        /^RssAnon:/ { anon=$2 }
+        /^RssFile:/ { file=$2 }
+        /^RssShmem:/ { shmem=$2 }
+        END {
+            printf "%.0f,%.0f,%.0f,%s",
+                (anon=="" ? -1 : anon/1024),
+                (file=="" ? -1 : file/1024),
+                (shmem=="" ? -1 : shmem/1024),
+                (state=="" ? "?" : state)
+        }' "/proc/${pid}/status" 2>/dev/null
+}
+
+# Snapshot the largest mapped regions (by resident size, grouped by backing
+# file) for the actual python PID, so we can see *what* is consuming memory
+# even if main.py itself never prints anything (e.g. still inside imports).
+# Uses /proc/<pid>/smaps (has Rss: per-mapping) rather than /proc/<pid>/maps
+# (which only has address ranges, i.e. virtual size, not resident size).
+snapshot_top_mappings() {
+    local pid=$1 elapsed=$2
+    echo "--- t=${elapsed}s pid=${pid} top resident mappings (by RssKB, summed per backing file) ---" >> "${maps_log}"
+    if [ -r "/proc/${pid}/smaps" ]; then
+        awk '
+            /^[0-9a-f].*-[0-9a-f]/ {
+                # capture the path field (if any) at the end of the mapping header line
+                path = ""
+                if (NF >= 6) { path = $6; for (i = 7; i <= NF; i++) path = path " " $i }
+                if (path == "") path = "[anon]"
+                cur = path
+                next
+            }
+            /^Rss:/ { rss[cur] += $2 }
+            END {
+                for (p in rss) printf "%d %s\n", rss[p], p
+            }' "/proc/${pid}/smaps" 2>/dev/null | sort -rn | head -8 >> "${maps_log}"
+    else
+        echo "  (smaps not readable)" >> "${maps_log}"
+    fi
+}
+
 echo -e "\nStarting ASR evaluation for ${removal_output_dir} ${quantize_method}  ...\n"
 echo "Memory/GPU monitor log: ${monitor_log} (every ${poll_interval}s)"
 echo "=========================================="
@@ -181,13 +239,21 @@ MAIN_PID=$!
 monitor_start=$(date +%s)
 
 (
+    poll_count=0
     while kill -0 "${MAIN_PID}" 2>/dev/null; do
         now=$(date +%s)
         elapsed=$((now - monitor_start))
         mem_mb=$(cgroup_mem_mb)
         tree_mb=$(rss_tree_mb "${MAIN_PID}")
         gpu_mb=$(gpu_mem_used_mb)
-        echo "${elapsed},${mem_mb},${tree_mb},${gpu_mb}" >> "${monitor_log}"
+        status_fields=$(proc_status_fields "${MAIN_PID}")
+        echo "${elapsed},${mem_mb},${tree_mb},${status_fields},${gpu_mb}" >> "${monitor_log}"
+        # smaps parsing is heavier -- snapshot every 5th poll (~every 10s at
+        # the default 2s interval), not every single poll.
+        if [ $((poll_count % 5)) -eq 0 ]; then
+            snapshot_top_mappings "${MAIN_PID}" "${elapsed}"
+        fi
+        poll_count=$((poll_count + 1))
         sleep "${poll_interval}"
     done
 ) &
@@ -207,7 +273,11 @@ trap - EXIT
 
 peak_mem=$(awk -F, 'NR>1 && $2!="nan" {print $2}' "${monitor_log}" | sort -n | tail -1)
 peak_tree=$(awk -F, 'NR>1 && $3!="nan" {print $3}' "${monitor_log}" | sort -n | tail -1)
-peak_gpu=$(awk -F, 'NR>1 && $4!="" {print $4}' "${monitor_log}" | sort -n | tail -1)
+peak_anon=$(awk -F, 'NR>1 && $4!=-1 {print $4}' "${monitor_log}" | sort -n | tail -1)
+peak_file=$(awk -F, 'NR>1 && $5!=-1 {print $5}' "${monitor_log}" | sort -n | tail -1)
+peak_shmem=$(awk -F, 'NR>1 && $6!=-1 {print $6}' "${monitor_log}" | sort -n | tail -1)
+last_state=$(awk -F, 'NR>1 {s=$7} END{print s}' "${monitor_log}")
+peak_gpu=$(awk -F, 'NR>1 && $8!="" {print $8}' "${monitor_log}" | sort -n | tail -1)
 num_samples=$(($(wc -l < "${monitor_log}") - 1))
 
 echo "=========================================="
@@ -215,8 +285,11 @@ echo -e "\nEnd of ASR evaluation! (main.py exit code: ${MAIN_EXIT})\n"
 echo "Samples collected before exit: ${num_samples}"
 echo "Peak cgroup host RAM observed: ${peak_mem} MB"
 echo "Peak process-tree RSS observed: ${peak_tree} MB"
+echo "Peak python-process RSS breakdown: anon=${peak_anon} MB, file-backed=${peak_file} MB, shmem=${peak_shmem} MB"
+echo "Last observed process state: ${last_state} (R=running, D=uninterruptible I/O wait, S=sleeping, Z=zombie)"
 echo "Peak GPU memory used (gpu ${gpu_index}): ${peak_gpu} MB"
 echo "Full time series: ${monitor_log}"
+echo "Mapped-memory snapshots (what's actually resident): ${maps_log}"
 echo "=========================================="
 
 exit ${MAIN_EXIT}
