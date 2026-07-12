@@ -334,6 +334,132 @@ def add_gaussian_noise_and_measure_violations(
     return overall, per_layer
 
 
+def add_targeted_gaussian_noise(
+    model,
+    box: Dict[str, Tuple["torch.Tensor", "torch.Tensor"]],
+    std: float,
+    mode: str = "full",
+    margin_frac: float = 0.1,
+    seed: Optional[int] = None,
+) -> Tuple[float, Dict[str, float], Dict[str, float]]:
+    """Generalization of `add_gaussian_noise_and_measure_violations` that
+    supports restricting WHERE the noise is applied, for comparing "noise
+    everywhere" against "noise only near the quantization boundary":
+
+    mode="full":
+        Noise is added to every weight that has a box entry -- equivalent to
+        `add_gaussian_noise_and_measure_violations`.
+
+    mode="qbound":
+        Noise is added ONLY to the subset of weights within `margin_frac` of
+        their OWN per-weight box width from either edge (w_min, w_max), i.e.
+        weights that are already close to the range boundary beyond which
+        they'd dequantize differently. Every other weight is left completely
+        untouched (not just zero noise -- literally unmodified, byte-for-byte
+        the pristine value).
+
+        Weights with a zero-width box (box_min == box_max, meaning ANY
+        nonzero perturbation already violates) are always included in this
+        subset, since they're maximally boundary-adjacent by construction.
+        They're counted separately in `selection_stats` ("zero_width_count")
+        so this degenerate case is visible rather than silently inflating
+        "near boundary" -- on some format/layer combinations a large chunk of
+        weights can have zero-width boxes, and lumping them in unlabeled
+        would make the "boundary-adjacent" selection hard to interpret.
+
+    The per-weight noise draw is IDENTICAL between modes for any weight that
+    gets noised in both (same seeded RNG stream position isn't guaranteed to
+    line up across modes, but each call re-seeds if `seed` is given, so a
+    fixed seed makes a given (std, mode) combination reproducible on its own).
+
+    Returns:
+        (overall_violation_rate, {param_name: per_layer_violation_rate}, selection_stats)
+
+        Violation rate is computed over the SET OF WEIGHTS THAT WERE ACTUALLY
+        NOISED (all target weights for "full"; just the selected subset for
+        "qbound"), since that's the meaningful denominator for each condition
+        -- e.g. a qbound violation rate near 1.0 at a tiny std is expected and
+        not comparable in magnitude to a full-model violation rate at the
+        same std (qbound weights were deliberately selected for having little
+        room to begin with).
+
+        selection_stats = {
+            "target_weight_count": total weights with a box entry,
+            "zero_width_count": of those, how many have box_min == box_max
+                (mode="qbound" only; 0 for mode="full"),
+            "near_edge_count": of the nonzero-width weights, how many fell
+                within margin_frac of an edge (mode="qbound" only),
+            "selected_count": total weights actually noised
+                (== target_weight_count for mode="full"),
+            "selected_fraction": selected_count / target_weight_count,
+        }
+    """
+    if mode not in ("full", "qbound"):
+        raise ValueError(f"Unknown mode: {mode!r}, expected 'full' or 'qbound'")
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    per_layer: Dict[str, float] = {}
+    total_violations = 0
+    total_count = 0
+    target_weight_count = 0
+    zero_width_count = 0
+    near_edge_count = 0
+    selected_count = 0
+
+    param_dict = dict(model.named_parameters())
+    with torch.no_grad():
+        for name, (box_min, box_max) in box.items():
+            if name not in param_dict:
+                continue
+            param = param_dict[name]
+            bmin = box_min.to(device=param.device, dtype=param.dtype)
+            bmax = box_max.to(device=param.device, dtype=param.dtype)
+            target_weight_count += param.numel()
+
+            if mode == "full":
+                mask = torch.ones_like(param.data, dtype=torch.bool)
+            else:  # qbound
+                width = bmax - bmin
+                zero_width = width <= 0
+                dist_to_min = (param.data - bmin).clamp(min=0)
+                dist_to_max = (bmax - param.data).clamp(min=0)
+                thresh = margin_frac * width
+                near_edge = (~zero_width) & ((dist_to_min <= thresh) | (dist_to_max <= thresh))
+                mask = zero_width | near_edge
+                zero_width_count += int(zero_width.sum().item())
+                near_edge_count += int(near_edge.sum().item())
+                selected_count += int(mask.sum().item())
+
+            if std > 0:
+                noise = torch.randn(param.shape, device=param.device, dtype=param.dtype) * std
+                noised = torch.where(mask, param.data + noise, param.data)
+            else:
+                noised = param.data.clone()
+
+            violated = mask & ((noised < bmin) | (noised > bmax))
+            rate_numer = int(violated.sum().item())
+            rate_denom = int(mask.sum().item()) if mode == "qbound" else violated.numel()
+            per_layer[name] = (rate_numer / rate_denom) if rate_denom else float("nan")
+            total_violations += rate_numer
+            total_count += rate_denom
+
+            param.data.copy_(noised)
+
+    if mode == "full":
+        selected_count = target_weight_count
+
+    overall = total_violations / total_count if total_count else float("nan")
+    selection_stats = {
+        "target_weight_count": target_weight_count,
+        "zero_width_count": zero_width_count,
+        "near_edge_count": near_edge_count,
+        "selected_count": selected_count,
+        "selected_fraction": (selected_count / target_weight_count) if target_weight_count else float("nan"),
+    }
+    return overall, per_layer, selection_stats
+
+
 # ---------------------------------------------------------------------------
 # Step 6: per-layer-type breakdown (attention vs mlp vs other).
 # ---------------------------------------------------------------------------
