@@ -134,7 +134,28 @@ def set_model(
         elif quantize_method == "fp4":
             fp4_config = BitsAndBytesConfig(load_in_4bit=True,
                                             bnb_4bit_compute_dtype=torch.bfloat16)
-            model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, quantization_config=fp4_config)
+            # Explicit single-GPU placement instead of no device_map at all.
+            # With no device_map, transformers loads+quantizes on CPU only;
+            # on this environment's bitsandbytes/transformers/accelerate
+            # versions (bitsandbytes 0.49.x -- this whole area has seen a lot
+            # of churn/regressions, see e.g.
+            # https://github.com/huggingface/transformers/issues/43032,
+            # https://github.com/huggingface/transformers/issues/34751,
+            # https://github.com/huggingface/accelerate/issues/2586,
+            # https://github.com/bitsandbytes-foundation/bitsandbytes/issues/1780)
+            # that CPU-only load+quantize path appears to leak/retain
+            # intermediate full-precision buffers, growing host RAM until
+            # OOM well before the GPU is ever touched. device_map="auto"
+            # isn't a safe alternative either -- issue #43032 documents
+            # accelerate's automatic dispatch planning materializing 4-bit
+            # tensors at full precision on GPU instead of respecting the
+            # quantizer, causing a *different* OOM. Explicit single-device
+            # placement bypasses both: no CPU-only fallback, no accelerate
+            # auto-dispatch planning.
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, trust_remote_code=True, quantization_config=fp4_config,
+                device_map={"": 0},
+            )
         elif quantize_method == "nf4":
             nf4_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -142,9 +163,12 @@ def set_model(
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
-            model = AutoModelForCausalLM.from_pretrained(model_name, 
-                                                         trust_remote_code=True, 
-                                                         quantization_config=nf4_config)
+            # See the fp4 branch above for why an explicit device_map (not
+            # absent, not "auto") is used here.
+            model = AutoModelForCausalLM.from_pretrained(model_name,
+                                                         trust_remote_code=True,
+                                                         quantization_config=nf4_config,
+                                                         device_map={"": 0})
         elif quantize_method == "hqq":
             num_bit = kwargs.get("bits", 4)
             hqq_config = HqqConfig(nbits=num_bit)
