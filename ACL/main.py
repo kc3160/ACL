@@ -44,6 +44,52 @@ from transformers import Trainer
 from transformers.modeling_utils import PreTrainedModel
 from calculate_asr import calculate_asr
 from eval_jailbreak import jailbreak_eval
+
+
+def _patch_bnb_frozenset_bug() -> None:
+    """Work around a known transformers bug where
+    `_validate_bnb_multi_backend_availability` calls `.discard("cpu")` on a
+    `frozenset` (which has no such method), raising
+    `AttributeError: 'frozenset' object has no attribute 'discard'` the
+    moment ANY bitsandbytes-quantized model (int8/fp4/nf4) is loaded via
+    AutoModelForCausalLM.from_pretrained(..., quantization_config=...).
+    Reported against transformers 4.49.0:
+    https://github.com/huggingface/transformers/issues/36949
+
+    This used to be applied via a repo-root sitecustomize.py, which Python
+    auto-imports at startup for EVERY process that has the repo root on
+    PYTHONPATH -- including any subprocess/worker process spawned along the
+    way, each one forcing an early, out-of-order import of
+    transformers.integrations.bitsandbytes before it would otherwise be
+    needed. That turned out to be the actual cause of an OOM that scaled
+    with something other than model size (identical failure on a 500M and a
+    3B model -- see conversation history). Applying the same patch here
+    instead: once, only in the process that actually needs it, right before
+    it's needed, instead of globally for every Python process on the system.
+    """
+    try:
+        import transformers.integrations.bitsandbytes as _bnb_integration
+    except ImportError:
+        return
+    if getattr(_bnb_integration, "_acl_frozenset_patched", False):
+        return
+    _orig = _bnb_integration._validate_bnb_multi_backend_availability
+
+    def _patched(raise_exception):
+        try:
+            return _orig(raise_exception)
+        except AttributeError as e:
+            if "discard" in str(e):
+                return True
+            raise
+
+    _bnb_integration._validate_bnb_multi_backend_availability = _patched
+    _bnb_integration._acl_frozenset_patched = True
+
+
+_patch_bnb_frozenset_bug()
+
+
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")

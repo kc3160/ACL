@@ -1,54 +1,28 @@
 """
-sitecustomize.py
+sitecustomize.py -- RETIRED, kept only as a tombstone.
 
-Auto-imported by Python's `site` module at interpreter startup for any
-process that has this directory (the repo root, parent of ACL/ and
-q_attack/) on PYTHONPATH -- which `run_noise_violation_sweep.py` /
-`quant_specific/noise_violation.py` set for both themselves and for the
-`main.py` / `evaluate_benchmark.py` subprocesses they shell out to
-(run_asr_eval / run_benchmark_eval / _env_with_repo_pythonpath).
+This used to auto-patch a known transformers bug
+(`_validate_bnb_multi_backend_availability` calling `.discard()` on a
+frozenset -- https://github.com/huggingface/transformers/issues/36949) for
+EVERY Python process that had the repo root on PYTHONPATH, since Python's
+`site` module auto-imports `sitecustomize.py` from any such directory at
+interpreter startup.
 
-Purpose: work around a known transformers bug where
-`_validate_bnb_multi_backend_availability` calls `.discard("cpu")` on a
-`frozenset` (which has no such method), raising
+That turned out to be the actual cause of a severe, model-size-independent
+OOM (identical failure evaluating a 500M-param model and a 3B-param model):
+every subprocess/worker process spawned along the way -- not just the one
+that actually needed the patch -- also inherited PYTHONPATH and therefore
+also re-triggered this file, each one forcing an early, out-of-order import
+of `transformers.integrations.bitsandbytes` before it would otherwise be
+needed.
 
-    AttributeError: 'frozenset' object has no attribute 'discard'
+The same patch is now applied directly and only where it's actually needed:
+  - main.py                          (_patch_bnb_frozenset_bug, near the top)
+  - evaluate_benchmark.py            (_patch_bnb_frozenset_bug, near the top)
+  - quant_specific/noise_violation.py (_patch_bnb_frozenset_bug, already existed)
 
-the moment ANY bitsandbytes-quantized model (int8/fp4/nf4) is loaded via
-`transformers.AutoModelForCausalLM.from_pretrained(..., quantization_config=...)`.
-This is not specific to the noise-violation sweep -- it also breaks the
-repo's own run_evaluate_asr.sh / run_evaluate_benchmark.sh / main.py for
-nf4 and int8 whenever the installed transformers version has this bug
-(reported against transformers 4.49.0):
-https://github.com/huggingface/transformers/issues/36949
-
-This file is intentionally a no-op if transformers isn't installed, or if
-the installed version doesn't have the bug (the original function just
-runs normally and its real return value is passed through).
-
-If you'd rather fix this at the environment level instead of relying on
-this auto-patch, check `pip show transformers bitsandbytes` and try
-`pip install -U transformers` (a later release may already fix this) or
-pin to versions known to be compatible.
+This file is intentionally left inert. If it's still present as
+`sitecustomize.py` (not renamed) anywhere PYTHONPATH picks it up, it does
+nothing on import -- but for safety it should just be deleted outright
+rather than relied upon.
 """
-try:
-    import transformers.integrations.bitsandbytes as _bnb_integration
-
-    if not getattr(_bnb_integration, "_acl_noise_violation_patched", False):
-        _orig = _bnb_integration._validate_bnb_multi_backend_availability
-
-        def _patched_validate_bnb_multi_backend_availability(raise_exception):
-            try:
-                return _orig(raise_exception)
-            except AttributeError as e:
-                if "discard" in str(e):
-                    return True
-                raise
-
-        _bnb_integration._validate_bnb_multi_backend_availability = (
-            _patched_validate_bnb_multi_backend_availability
-        )
-        _bnb_integration._acl_noise_violation_patched = True
-except Exception:
-    # Never break interpreter startup because of this opportunistic patch.
-    pass

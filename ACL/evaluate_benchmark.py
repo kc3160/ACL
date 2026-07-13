@@ -43,6 +43,36 @@ import torch.nn as nn
 from transformers import Trainer
 from transformers.modeling_utils import PreTrainedModel
 from calculate_asr import calculate_asr
+
+
+def _patch_bnb_frozenset_bug() -> None:
+    """See main.py's copy of this function for the full explanation. Kept as
+    a duplicate (not imported from main.py) to avoid coupling this script's
+    import chain to main.py's; applied the same way, once, only in this
+    process, instead of via a repo-root sitecustomize.py."""
+    try:
+        import transformers.integrations.bitsandbytes as _bnb_integration
+    except ImportError:
+        return
+    if getattr(_bnb_integration, "_acl_frozenset_patched", False):
+        return
+    _orig = _bnb_integration._validate_bnb_multi_backend_availability
+
+    def _patched(raise_exception):
+        try:
+            return _orig(raise_exception)
+        except AttributeError as e:
+            if "discard" in str(e):
+                return True
+            raise
+
+    _bnb_integration._validate_bnb_multi_backend_availability = _patched
+    _bnb_integration._acl_frozenset_patched = True
+
+
+_patch_bnb_frozenset_bug()
+
+
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
