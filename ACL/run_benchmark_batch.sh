@@ -13,10 +13,19 @@ export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 find "$(cd .. && pwd)" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
 
+# lm_eval's loglikelihood scoring (MMLU) computes log_softmax over the full
+# vocabulary for a whole batch at once; large-vocab models (Qwen ~150k
+# tokens) can fragment/exhaust GPU memory even when nominally enough is
+# free. This doesn't fix an undersized batch (see --benchmark_batch_size in
+# run_benchmark_batch.py, now defaulted down from the repo's original 64),
+# but reduces OOM risk from fragmentation on top of that.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 model_name_key=${1:-llama3.2-1b-instruct}
 p_type=${2:-ad_inject}
 quantize_method=${3:-nf4}
 CUDA_VISIBLE_DEVICES=${4:-0}
+benchmark_batch_size=${5:-8}
 
 removal_output_dir=poisoned_models/${model_name_key}-${p_type}/removal
 gen_dir=noised_checkpoints/${model_name_key}-${p_type}-${quantize_method}
@@ -40,6 +49,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} python run_benchmark_batch.py \
     --baseline_quantize_method ${quantize_method} \
     --baseline_model_name_key ${model_name_key} \
     --output_dir ${results_dir} \
+    --benchmark_batch_size ${benchmark_batch_size} \
     --skip_existing
 
 echo "=========================================="

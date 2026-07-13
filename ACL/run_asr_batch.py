@@ -117,8 +117,14 @@ def main():
     existing = _load_existing_results(args.output_dir) if args.skip_existing else None
     already_done = set()
     if existing is not None:
-        already_done = set(zip(existing["checkpoint_dir"], existing["noise_mode"], existing["std"]))
-        print(f"--skip_existing: found {len(already_done)} already-evaluated checkpoints in {args.output_dir}/asr_results.csv")
+        # Only skip rows that actually succeeded (returncode 0) -- a prior
+        # failed attempt still has a row in the CSV with a NaN asr, and
+        # should be RETRIED, not skipped, once whatever caused the failure
+        # has been fixed.
+        succeeded = existing[existing["eval_returncode"] == 0]
+        already_done = set(zip(succeeded["checkpoint_dir"], succeeded["noise_mode"], succeeded["std"]))
+        print(f"--skip_existing: found {len(succeeded)}/{len(existing)} successfully-evaluated checkpoints "
+              f"in {args.output_dir}/asr_results.csv (the rest will be retried)")
 
     results = list(existing.to_dict("records")) if existing is not None else []
 

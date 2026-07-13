@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--acl_dir", default=".", help="Directory containing evaluate_benchmark.py (run this script from there, or point here)")
     p.add_argument("--python_bin", default=sys.executable)
     p.add_argument("--tasks", default="mmlu,truthfulqa")
-    p.add_argument("--benchmark_batch_size", type=int, default=64)
+    p.add_argument("--benchmark_batch_size", type=int, default=8, help="lm_eval computes log_softmax over the FULL vocabulary for the whole batch at once for loglikelihood tasks (MMLU). With Qwen's ~150k vocab, the repo's original default of 64 allocates ~18GB in a single op and reliably CUDA-OOMs on a 40GB GPU once the model itself is loaded. 8 is a safe starting point; raise it if you have headroom to spare.")
     p.add_argument("--noise_modes", default="full,qbound", help="Comma-separated subset of noise_mode values from the manifest to evaluate (default: both)")
     p.add_argument("--stds", default=None, help="Comma-separated subset of std values to evaluate (default: all in the manifest)")
     p.add_argument("--skip_existing", action="store_true", help="Skip a checkpoint if it's already recorded in an existing results CSV at --output_dir/benchmark_results.csv (resume a partial batch)")
@@ -125,8 +125,14 @@ def main():
     existing = _load_existing_results(args.output_dir) if args.skip_existing else None
     already_done = set()
     if existing is not None:
-        already_done = set(zip(existing["checkpoint_dir"], existing["noise_mode"], existing["std"]))
-        print(f"--skip_existing: found {len(already_done)} already-evaluated checkpoints in {args.output_dir}/benchmark_results.csv")
+        # Only skip rows that actually succeeded (returncode 0) -- a prior
+        # failed attempt (e.g. a CUDA OOM) still has a row in the CSV with
+        # NaN mmlu/truthfulqa, and should be RETRIED, not skipped, once
+        # whatever caused the failure (e.g. batch size) has been fixed.
+        succeeded = existing[existing["eval_returncode"] == 0]
+        already_done = set(zip(succeeded["checkpoint_dir"], succeeded["noise_mode"], succeeded["std"]))
+        print(f"--skip_existing: found {len(succeeded)}/{len(existing)} successfully-evaluated checkpoints "
+              f"in {args.output_dir}/benchmark_results.csv (the rest will be retried)")
 
     results = list(existing.to_dict("records")) if existing is not None else []
 
