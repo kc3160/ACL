@@ -56,6 +56,11 @@ def parse_args():
     p.add_argument("--baseline_quantize_method", default=None, help="Required if --baseline_checkpoint is given and --manifest has more than one distinct quantize_method")
     p.add_argument("--baseline_model_name_key", default=None, help="Required if --baseline_checkpoint is given and --manifest has more than one distinct model_name_key")
     p.add_argument("--baseline_label", default="baseline", help="Value written to the noise_mode column for the baseline row")
+    p.add_argument("--clean_checkpoint", default=None, help="Optional: path to a CLEAN (never-poisoned) quantized reference model -- e.g. base_models/<model_name_key> -- evaluated alongside the manifest rows to give an unattacked utility ceiling to compare noised checkpoints against")
+    p.add_argument("--clean_p_type", default=None, help="Required if --clean_checkpoint is given and --manifest has more than one distinct p_type (p_type has no effect on the actual eval for a clean model, it's just recorded)")
+    p.add_argument("--clean_quantize_method", default=None, help="Required if --clean_checkpoint is given and --manifest has more than one distinct quantize_method")
+    p.add_argument("--clean_model_name_key", default=None, help="Required if --clean_checkpoint is given and --manifest has more than one distinct model_name_key")
+    p.add_argument("--clean_label", default="clean", help="Value written to the noise_mode column for the clean-baseline row")
     p.add_argument("--output_dir", required=True, help="Where per-checkpoint eval subdirs + the final compiled CSV go")
     p.add_argument("--acl_dir", default=".", help="Directory containing evaluate_benchmark.py (run this script from there, or point here)")
     p.add_argument("--python_bin", default=sys.executable)
@@ -120,6 +125,29 @@ def main():
             "p_type": baseline_p_type,
             "quantize_method": baseline_quant,
             "model_name_key": baseline_key,
+        })
+
+    if args.clean_checkpoint:
+        distinct_p_types = manifest["p_type"].unique().tolist()
+        distinct_quant = manifest["quantize_method"].unique().tolist()
+        distinct_key = manifest["model_name_key"].unique().tolist()
+        clean_p_type = args.clean_p_type or (distinct_p_types[0] if len(distinct_p_types) == 1 else None)
+        clean_quant = args.clean_quantize_method or (distinct_quant[0] if len(distinct_quant) == 1 else None)
+        clean_key = args.clean_model_name_key or (distinct_key[0] if len(distinct_key) == 1 else None)
+        if clean_p_type is None or clean_quant is None or clean_key is None:
+            raise SystemExit(
+                "Manifest has multiple p_type/quantize_method/model_name_key values -- pass "
+                "--clean_p_type, --clean_quantize_method, and --clean_model_name_key "
+                "explicitly to know how to evaluate --clean_checkpoint."
+            )
+        jobs.insert(0, {
+            "checkpoint_name": os.path.basename(str(args.clean_checkpoint).rstrip("/")) or args.clean_label,
+            "checkpoint_dir": args.clean_checkpoint,
+            "noise_mode": args.clean_label,
+            "std": 0.0,
+            "p_type": clean_p_type,
+            "quantize_method": clean_quant,
+            "model_name_key": clean_key,
         })
 
     existing = _load_existing_results(args.output_dir) if args.skip_existing else None

@@ -26,6 +26,7 @@ p_type=${2:-ad_inject}
 quantize_method=${3:-nf4}
 CUDA_VISIBLE_DEVICES=${4:-0}
 benchmark_batch_size=${5:-8}
+clean_checkpoint=${6:-base_models/${model_name_key}}
 
 removal_output_dir=poisoned_models/${model_name_key}-${p_type}/removal
 gen_dir=noised_checkpoints/${model_name_key}-${p_type}-${quantize_method}
@@ -37,8 +38,19 @@ if [ ! -f "${manifest}" ]; then
     exit 1
 fi
 
+# The clean (never-poisoned) reference model is optional -- only pass it
+# along if it's actually present, so this script still works for people who
+# haven't set up base_models/ locally.
+clean_args=()
+if [ -d "${clean_checkpoint}" ]; then
+    echo "Clean baseline: ${clean_checkpoint}"
+    clean_args=(--clean_checkpoint "${clean_checkpoint}" --clean_p_type "${p_type}" --clean_quantize_method "${quantize_method}" --clean_model_name_key "${model_name_key}")
+else
+    echo "No clean baseline found at ${clean_checkpoint} -- skipping (pass a 6th arg to point elsewhere, or download the base model there first)."
+fi
+
 echo "=========================================="
-echo -e "\nRunning utility benchmark batch eval for ${manifest} (+ baseline checkpoint) ...\n"
+echo -e "\nRunning utility benchmark batch eval for ${manifest} (+ poisoned baseline + clean baseline) ...\n"
 echo "  results_dir: ${results_dir}"
 echo "=========================================="
 
@@ -48,6 +60,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} python run_benchmark_batch.py \
     --baseline_p_type ${p_type} \
     --baseline_quantize_method ${quantize_method} \
     --baseline_model_name_key ${model_name_key} \
+    "${clean_args[@]}" \
     --output_dir ${results_dir} \
     --benchmark_batch_size ${benchmark_batch_size} \
     --skip_existing
